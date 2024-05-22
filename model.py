@@ -41,6 +41,29 @@ def precompute_theta_pos_frequencies(head_dim:int, seq_len:int ,device:str, thet
     # Now, once we have all the m*theta we can calculate the re^(i * m * theta)
     freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_complex
+
+def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
+
+    # (B, Seq_len, H, head_dim) -> (B, Seq_len, H, head_dim / 2) as we are pairing consequtive embeds.
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+
+    # Now we have to multiply x_complex and complex freqs element wise as per paper
+    # Shape : (1, Seq_len, 1, head_dim / 2)
+    freqs_complex =freqs_complex.unsqueeze(0).unsqueeze(2)
+
+    # Shape (B, Seq_len, H, head_dim / 2)
+    x_rotated = x_complex * freqs_complex
+
+    # Converting the obtained complex numbers to tensors.
+    # Shape (B, Seq_len, H, head_dim / 2, 2)
+    x_out = torch.view_as_real(x_rotated)
+
+    # Then we flatten x_out and bring it back to the original tensor shape
+    x_out = x_out.reshape(*x.shape)
+
+    return x_out.type_as(x).to(device)
+
+
     
 
 class Transformer(nn.Module):
