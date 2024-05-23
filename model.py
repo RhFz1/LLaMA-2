@@ -22,7 +22,7 @@ class ModelArgs:
 
     device: str = None
 
-def precompute_theta_pos_frequencies(head_dim:int, seq_len:int ,device:str, theta:float = 10000.0):
+def precompute_theta_pos_frequency(head_dim:int, seq_len:int ,device:str, theta:float = 10000.0):
 
     # As per the paper the head_dim should be an even number
     assert head_dim % 2 == 0, "Dimension must be an even number"
@@ -63,8 +63,20 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device
 
     return x_out.type_as(x).to(device)
 
-
+class RMSNorm(nn.Module):
     
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.gain = nn.Parameter(torch.ones(dim))
+    def _norm(self, x: torch.Tensor):
+        # (B, T, C)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    def forward(self, x: torch.Tensor):
+        # (C) * (B, T, C) -> (B, T, C)
+        return self.weight * self._norm(x.float()).type_as(x)
+    
+
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs) -> None:
