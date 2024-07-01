@@ -44,14 +44,14 @@ def precompute_theta_pos_frequency(head_dim:int, seq_len:int ,device:str, theta:
 
 def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
 
-    # (B, Seq_len, H, head_dim) -> (B, Seq_len, H, head_dim / 2) as we are pairing consequtive embeds.
+    # (B, Seq_len, H, head_dim) -> (B, Seq_len, H, head_dim / 2, 2) as we are pairing consequtive embeds.
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
 
     # Now we have to multiply x_complex and complex freqs element wise as per paper
     # Shape : (1, Seq_len, 1, head_dim / 2)
     freqs_complex =freqs_complex.unsqueeze(0).unsqueeze(2)
 
-    # Shape (B, Seq_len, H, head_dim / 2)
+    # Shape (B, Seq_len, H, head_dim / 2, 2)
     x_rotated = x_complex * freqs_complex
 
     # Converting the obtained complex numbers to tensors.
@@ -75,8 +75,29 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         # (C) * (B, T, C) -> (B, T, C)
         return self.weight * self._norm(x.float()).type_as(x)
-    
 
+class EncoderBlock(nn.Module):
+    
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.dim = config.dim
+        self.n_heads = config.n_heads
+        self.head_dim = self.dim // self.n_heads
+        self.attention = SelfAttention(config)
+        self.feed_forward = FeedForward(config)
+        _
+        self.attention_norm = RMSNorm(self.dim, eps=config.norm_eps)
+        self.ff_norm = RMSNorm(self.dim, eps=config.norm_eps)
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
+        # (B, Seq_Len, dim) + (B, Seq_Len, dim) -> (B, Seq_Len, dim)
+        h = x + self.attention.forward(
+            self.attention_norm(x), start_pos, freqs_complex)
+        
+
+        out = h + self.feed_forward.forward(self.ff_norm(h))
+
+        return out.float()
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs) -> None:
