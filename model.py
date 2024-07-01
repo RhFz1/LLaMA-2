@@ -46,7 +46,6 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device
 
     # (B, Seq_len, H, head_dim) -> (B, Seq_len, H, head_dim / 2, 2) as we are pairing consequtive embeds.
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-
     # Now we have to multiply x_complex and complex freqs element wise as per paper
     # Shape : (1, Seq_len, 1, head_dim / 2)
     freqs_complex =freqs_complex.unsqueeze(0).unsqueeze(2)
@@ -63,6 +62,19 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device
 
     return x_out.type_as(x).to(device)
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch_size, seq_len, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        # (B, Seq_Len, N_KV_Heads, 1, Head_Dim)
+        x[:, :, :, None, :]
+        # (B, Seq_Len, N_KV_Heads, N_Rep, Head_Dim)
+        .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+        # (B, Seq_Len, N_KV_Heads * N_Rep, Head_Dim)
+        .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim)
+    )
+
 class RMSNorm(nn.Module):
     
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -76,6 +88,86 @@ class RMSNorm(nn.Module):
         # (C) * (B, T, C) -> (B, T, C)
         return self.weight * self._norm(x.float()).type_as(x)
 
+class FeedForward(nn.Module):
+    
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.dim = config.dim
+        self.hidden_dim = int(config.ffn_dim_multiplier * config.dim) if config.ffn_dim_multiplier is not None else 4 * config.dim
+        
+        self.w1 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.w2 = nn.Linear(self.hidden_dim, self.dim, bias=False)
+        self.w3 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, T, dim) -> (B, T, hidden_dim)
+        swish = F.silu(self.w1(x))
+        # (B, T, dim) -> (B, T, hidden_dim)
+        x_V = self.w3(x)
+        # (B, T, hidden_dim) * (B, T, hidden_dim) -> (B, T, hidden_dim)
+        x = swish * x_V
+        # (B, T, hidden_dim) -> (B, T, dim)
+        x = self.w2(x)
+        return x
+
+class SelfAttention(nn.Module):
+
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+
+        self.kv_heads = config.n_kv_heads if config.n_kv_heads is not None else self.n_heads
+        # Number of dimensions of the embedding
+        self.dim = config.dim
+        # Number of heads
+        self.n_heads = config.n_heads
+        # head dim for each head.
+        self.head_dim = self.dim // self.n_heads
+        # Indicates how many times the Keys and Values should be repeated
+        self.n_rep = self.n_heads_q // self.n_kv_heads
+
+        self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.dim, self.kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(self.dim, self.kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
+
+        self.cache_k = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len , _  = x.shape
+        
+        assert seq_len == 1, "Only one token can be processed at a time"
+
+        xq = self.wq(x).view(batch_size, seq_len, self.n_heads, self.head_dim) # (B, T, dim) -> (B, T, n_heads * head_dim)-> (B, T, n_heads, head_dim)
+        xk = self.wk(x).view(batch_size, seq_len, self.kv_heads, self.head_dim) # (B, T, dim) -> (B, T, n_kv_heads * head_dim) -> (B, T, n_kv_heads, head_dim)
+        xv = self.wv(x).view(batch_size, seq_len, self.kv_heads, self.head_dim) # (B, T, dim) -> (B, T, n_kv_heads * head_dim) -> (B, T, n_kv_heads, head_dim)
+
+        xq = apply_rotary_embeddings(xq, freqs_complex, device = x.device) # (B, T, n_heads, head_dim)
+        xk = apply_rotary_embeddings(xk, freqs_complex, device = x.device) # (B, T, n_kv_heads, head_dim)
+
+        # accessing and modifying the kv cache for the last token
+        self.cache_k[ :batch_size, : start_pos: start_pos + seq_len] = xk
+        self.cache_v[ :batch_size, : start_pos: start_pos + seq_len] = xv
+
+        k = self.cache_k[:batch_size, start_pos: start_pos + seq_len]
+        v = self.cache_v[:batch_size, start_pos: start_pos + seq_len]
+
+        # repeat the queries for the kv pairs
+        k = repeat_kv(k, self.n_rep) # (B, T, n_kv_heads, head_dim) -> (B, T, n_heads, head_dim)
+        v = repeat_kv(v, self.n_rep) # (B, T, n_kv_heads, head_dim) -> (B, T, n_heads, head_dim)
+
+        xq = xq.transpose(1 , 2) # (B, T, n_heads, head_dim) -> (B, n_heads, T, head_dim)
+
+        keys = k.transpose(1, 2) # (B, T, n_heads, head_dim) -> (B, n_heads, T, head_dim)
+        values = v.transpose(1, 2) # (B, T, n_heads, head_dim) -> (B, n_heads, T, head_dim)
+
+        attn = (xq @ keys.transpose(-2, -1)) * (self.head_dim ** -0.5) # (B, n_heads, T, T)
+        attn = F.softmax(attn.float(), dim = -1).type_as(xq) # (B, n_heads, T, T)
+
+        out = attn @ values # (B, n_heads, T, T) @ (B, n_heads, T, head_dim) -> (B, n_heads, T, head_dim)
+        out = out.transpose(1, 2).view(batch_size, seq_len, -1) # (B, n_heads, T, head_dim) -> (B, T, n_heads * head_dim)
+        out = self.wo(out)
+        return out
 class EncoderBlock(nn.Module):
     
     def __init__(self, config: ModelArgs) -> None:
@@ -85,7 +177,6 @@ class EncoderBlock(nn.Module):
         self.head_dim = self.dim // self.n_heads
         self.attention = SelfAttention(config)
         self.feed_forward = FeedForward(config)
-        _
         self.attention_norm = RMSNorm(self.dim, eps=config.norm_eps)
         self.ff_norm = RMSNorm(self.dim, eps=config.norm_eps)
     
@@ -94,10 +185,10 @@ class EncoderBlock(nn.Module):
         h = x + self.attention.forward(
             self.attention_norm(x), start_pos, freqs_complex)
         
-
+        # (B, Seq_Len, dim) + (B, Seq_Len, dim) -> (B, Seq_Len, dim)
         out = h + self.feed_forward.forward(self.ff_norm(h))
 
-        return out.float()
+        return out
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs) -> None:
