@@ -115,19 +115,21 @@ class SelfAttention(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
 
-        self.kv_heads = config.n_kv_heads if config.n_kv_heads is not None else self.n_heads
+        
         # Number of dimensions of the embedding
         self.dim = config.dim
         # Number of heads
         self.n_heads = config.n_heads
+        # Number of kv heads
+        self.n_kv_heads = config.n_kv_heads if config.n_kv_heads is not None else self.n_heads
         # head dim for each head.
         self.head_dim = self.dim // self.n_heads
         # Indicates how many times the Keys and Values should be repeated
-        self.n_rep = self.n_heads_q // self.n_kv_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
 
         self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(self.dim, self.kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(self.dim, self.kv_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
 
         self.cache_k = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
@@ -139,8 +141,8 @@ class SelfAttention(nn.Module):
         assert seq_len == 1, "Only one token can be processed at a time"
 
         xq = self.wq(x).view(batch_size, seq_len, self.n_heads, self.head_dim) # (B, T, dim) -> (B, T, n_heads * head_dim)-> (B, T, n_heads, head_dim)
-        xk = self.wk(x).view(batch_size, seq_len, self.kv_heads, self.head_dim) # (B, T, dim) -> (B, T, n_kv_heads * head_dim) -> (B, T, n_kv_heads, head_dim)
-        xv = self.wv(x).view(batch_size, seq_len, self.kv_heads, self.head_dim) # (B, T, dim) -> (B, T, n_kv_heads * head_dim) -> (B, T, n_kv_heads, head_dim)
+        xk = self.wk(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim) # (B, T, dim) -> (B, T, n_kv_heads * head_dim) -> (B, T, n_kv_heads, head_dim)
+        xv = self.wv(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim) # (B, T, dim) -> (B, T, n_kv_heads * head_dim) -> (B, T, n_kv_heads, head_dim)
 
         xq = apply_rotary_embeddings(xq, freqs_complex, device = x.device) # (B, T, n_heads, head_dim)
         xk = apply_rotary_embeddings(xk, freqs_complex, device = x.device) # (B, T, n_kv_heads, head_dim)
@@ -228,6 +230,4 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_complex)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
-
-
+        return outputself.n_heads
