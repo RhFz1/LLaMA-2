@@ -230,4 +230,4 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_complex)
         h = self.norm(h)
         output = self.output(h).float()
-        return outputself.n_heads
+        return output
